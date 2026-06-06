@@ -47,7 +47,7 @@ final class MigrationExecutor: @unchecked Sendable {
     private let chunkSize = 2 * 1024 * 1024
 
     func resumableBytes(for item: MigrationItem, destinationRoot: URL) -> Int64 {
-        let temporaryDestination = temporaryDestinationURL(for: item, destinationRoot: destinationRoot)
+        let temporaryDestination = existingTemporaryDestinationURL(for: item, destinationRoot: destinationRoot)
         guard fileManager.fileExists(atPath: temporaryDestination.path) else {
             return 0
         }
@@ -78,7 +78,11 @@ final class MigrationExecutor: @unchecked Sendable {
         let finalDestination = uniqueDestinationURL(
             for: destinationRoot.appendingPathComponent(item.displayName, isDirectory: sourceIsDirectory)
         )
-        let temporaryDestination = temporaryDestinationURL(for: item, destinationRoot: destinationRoot, isDirectory: sourceIsDirectory)
+        let temporaryDestination = try preparedTemporaryDestinationURL(
+            for: item,
+            destinationRoot: destinationRoot,
+            isDirectory: sourceIsDirectory
+        )
 
         do {
             let entries = try collectEntries(from: item.sourceURL, skipSystemCaches: options.skipSystemCaches)
@@ -414,9 +418,132 @@ final class MigrationExecutor: @unchecked Sendable {
 
     private func temporaryDestinationURL(for item: MigrationItem, destinationRoot: URL, isDirectory: Bool) -> URL {
         destinationRoot.appendingPathComponent(
-            ".\(item.displayName).\(item.id.uuidString).drivedrop-part",
+            ".\(safeTemporaryBaseName(for: item.displayName)).\(resumeIdentifier(for: item, isDirectory: isDirectory)).drivedrop-part",
             isDirectory: isDirectory
         )
+    }
+
+    private func existingTemporaryDestinationURL(for item: MigrationItem, destinationRoot: URL) -> URL {
+        let sourceIsDirectory = item.sourceURL.hasDirectoryPath
+        let stableURL = temporaryDestinationURL(for: item, destinationRoot: destinationRoot, isDirectory: sourceIsDirectory)
+        if fileManager.fileExists(atPath: stableURL.path) {
+            return stableURL
+        }
+
+        return legacyTemporaryDestinationURL(
+            for: item,
+            destinationRoot: destinationRoot,
+            stableURL: stableURL,
+            isDirectory: sourceIsDirectory
+        ) ?? stableURL
+    }
+
+    private func preparedTemporaryDestinationURL(for item: MigrationItem, destinationRoot: URL, isDirectory: Bool) throws -> URL {
+        let stableURL = temporaryDestinationURL(for: item, destinationRoot: destinationRoot, isDirectory: isDirectory)
+        guard !fileManager.fileExists(atPath: stableURL.path),
+              let legacyURL = legacyTemporaryDestinationURL(
+                for: item,
+                destinationRoot: destinationRoot,
+                stableURL: stableURL,
+                isDirectory: isDirectory
+              )
+        else {
+            return stableURL
+        }
+
+        try fileManager.moveItem(at: legacyURL, to: stableURL)
+        return stableURL
+    }
+
+    private func legacyTemporaryDestinationURL(
+        for item: MigrationItem,
+        destinationRoot: URL,
+        stableURL: URL,
+        isDirectory: Bool
+    ) -> URL? {
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: destinationRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            options: []
+        ) else {
+            return nil
+        }
+
+        let oldPrefix = ".\(item.displayName)."
+        let safePrefix = ".\(safeTemporaryBaseName(for: item.displayName))."
+        let stableName = stableURL.lastPathComponent
+        let candidates = contents.compactMap { url -> (url: URL, modifiedAt: Date, bytes: Int64)? in
+            let name = url.lastPathComponent
+            guard name != stableName,
+                  name.hasSuffix(".drivedrop-part"),
+                  name.hasPrefix(oldPrefix) || name.hasPrefix(safePrefix)
+            else {
+                return nil
+            }
+
+            var isCandidateDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isCandidateDirectory),
+                  isCandidateDirectory.boolValue == isDirectory
+            else {
+                return nil
+            }
+
+            let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            let modifiedAt = values?.contentModificationDate ?? .distantPast
+            let bytes = (try? measuredSize(of: url, skipSystemCaches: false)) ?? 0
+            return bytes > 0 ? (url, modifiedAt, bytes) : nil
+        }
+
+        return candidates
+            .sorted { lhs, rhs in
+                if lhs.bytes != rhs.bytes {
+                    return lhs.bytes > rhs.bytes
+                }
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+            .first?
+            .url
+    }
+
+    private func resumeIdentifier(for item: MigrationItem, isDirectory: Bool) -> String {
+        var parts = [
+            item.sourceURL.standardizedFileURL.path,
+            item.displayName,
+            isDirectory ? "directory" : "file"
+        ]
+
+        if let values = try? item.sourceURL.resourceValues(forKeys: [.fileSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey]) {
+            let sourceBytes = values.fileSize ?? values.totalFileAllocatedSize ?? Int(item.estimatedSize)
+            parts.append("\(sourceBytes)")
+            if let modifiedAt = values.contentModificationDate {
+                parts.append("\(modifiedAt.timeIntervalSince1970)")
+            }
+        } else {
+            parts.append("\(item.estimatedSize)")
+        }
+
+        return stableHash(parts.joined(separator: "|"))
+    }
+
+    private func stableHash(_ value: String) -> String {
+        let prime: UInt64 = 1_099_511_628_211
+        var hash: UInt64 = 14_695_981_039_346_656_037
+
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* prime
+        }
+
+        return String(format: "%016llx", hash)
+    }
+
+    private func safeTemporaryBaseName(for name: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let scalars = name.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "_"
+        }
+        let cleaned = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "._-"))
+        return String((cleaned.isEmpty ? "item" : cleaned).prefix(80))
     }
 
     private func fileExistsAsDirectory(_ url: URL) -> Bool {

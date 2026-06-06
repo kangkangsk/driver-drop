@@ -10,6 +10,8 @@ struct VerifyMigrationExecutor {
         try await verifyKeepBothConflict(workspace: workspace)
         try await verifyResumePartialFile(workspace: workspace)
         try await verifyResumePartialDirectory(workspace: workspace)
+        try await verifyResumeAfterRestart(workspace: workspace)
+        try await verifyLegacyResumeFileAdoption(workspace: workspace)
 
         print("MigrationExecutor verification passed")
     }
@@ -144,6 +146,88 @@ struct VerifyMigrationExecutor {
         try require(result.resumedBytes == expectedResumedBytes, "partial directory bytes were not reused")
         try require(try Data(contentsOf: result.destinationURL.appendingPathComponent("cover.jpg")) == cover, "resumed directory cover mismatch")
         try require(try Data(contentsOf: result.destinationURL.appendingPathComponent("movie.mov")) == movie, "resumed directory movie mismatch")
+    }
+
+    private static func verifyResumeAfterRestart(workspace: TemporaryWorkspace) async throws {
+        let source = workspace.source.appendingPathComponent("restart.bin")
+        let sourceData = deterministicData(byteCount: 4 * 1024 * 1024 + 711)
+        try sourceData.write(to: source)
+
+        let firstQueueItem = MigrationItem(
+            id: UUID(),
+            sourceURL: source,
+            displayName: source.lastPathComponent,
+            sourceSummary: DriveFormatters.displayPath(for: workspace.source),
+            estimatedSize: Int64(sourceData.count),
+            status: .copying,
+            progress: 0.2,
+            hasConflict: false
+        )
+        let restartedQueueItem = MigrationItem(
+            id: UUID(),
+            sourceURL: source,
+            displayName: source.lastPathComponent,
+            sourceSummary: DriveFormatters.displayPath(for: workspace.source),
+            estimatedSize: Int64(sourceData.count),
+            status: .waiting,
+            progress: 0,
+            hasConflict: false
+        )
+
+        let executor = MigrationExecutor()
+        let firstTemporaryDestination = executor.temporaryDestinationURL(for: firstQueueItem, destinationRoot: workspace.destination)
+        let restartedTemporaryDestination = executor.temporaryDestinationURL(for: restartedQueueItem, destinationRoot: workspace.destination)
+        try require(firstTemporaryDestination == restartedTemporaryDestination, "resume temp path changed after queue restart")
+
+        let partialBytes = 1024 * 1024 + 301
+        try FileManager.default.createDirectory(at: workspace.destination, withIntermediateDirectories: true)
+        try Data(sourceData.prefix(partialBytes)).write(to: firstTemporaryDestination)
+
+        let result = try await executor.migrate(
+            item: restartedQueueItem,
+            destinationRoot: workspace.destination,
+            mode: .copy,
+            options: MigrationOptions()
+        ) { _ in }
+
+        try require(result.resumedBytes == Int64(partialBytes), "restart resume bytes were not reused")
+        try require(try Data(contentsOf: result.destinationURL) == sourceData, "restart resumed file content mismatch")
+    }
+
+    private static func verifyLegacyResumeFileAdoption(workspace: TemporaryWorkspace) async throws {
+        let source = workspace.source.appendingPathComponent("legacy.bin")
+        let sourceData = deterministicData(byteCount: 3 * 1024 * 1024 + 503)
+        try sourceData.write(to: source)
+
+        let item = MigrationItem(
+            id: UUID(),
+            sourceURL: source,
+            displayName: source.lastPathComponent,
+            sourceSummary: DriveFormatters.displayPath(for: workspace.source),
+            estimatedSize: Int64(sourceData.count),
+            status: .waiting,
+            progress: 0,
+            hasConflict: false
+        )
+
+        let partialBytes = 768 * 1024 + 45
+        try FileManager.default.createDirectory(at: workspace.destination, withIntermediateDirectories: true)
+        let legacyTemporaryDestination = workspace.destination.appendingPathComponent(
+            ".\(source.lastPathComponent).\(UUID().uuidString).drivedrop-part"
+        )
+        try Data(sourceData.prefix(partialBytes)).write(to: legacyTemporaryDestination)
+
+        let executor = MigrationExecutor()
+        let result = try await executor.migrate(
+            item: item,
+            destinationRoot: workspace.destination,
+            mode: .copy,
+            options: MigrationOptions()
+        ) { _ in }
+
+        try require(result.resumedBytes == Int64(partialBytes), "legacy partial file was not adopted")
+        try require(!FileManager.default.fileExists(atPath: legacyTemporaryDestination.path), "legacy partial file was not moved away")
+        try require(try Data(contentsOf: result.destinationURL) == sourceData, "legacy resumed file content mismatch")
     }
 
     private static func deterministicData(byteCount: Int) -> Data {
